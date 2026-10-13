@@ -11,10 +11,15 @@
  *
  * Output:
  *   p/meta.json      salt, iteration count, photo count, password check
- *   p/m.bin          encrypted manifest: [[width, height], ...] per photo
+ *   p/m.bin          encrypted manifest: { dims: [[width, height], ...],
+ *                    categories: [{ name, photos: [index, ...] }, ...] }
  *   p/t/0000.bin     encrypted thumbnail (webp)
  *   p/f/0000.bin     encrypted full-size copy (webp)
  * Each .bin is a 12-byte IV followed by the GCM ciphertext and tag.
+ *
+ * Categories come from tools/categories.json. The first one (Highlights) is a
+ * hand-picked set that may repeat photos; every other photo must land in
+ * exactly one of the remaining categories, or the build stops and says which.
  *
  * Re-running reuses the salt in p/meta.json and skips photos already built, so
  * it resumes after an interruption. It refuses to run with a different
@@ -84,6 +89,8 @@ if (meta) {
   }
 }
 
+const categories = loadCategories();
+
 const files = fs
   .readdirSync(src)
   .filter((f) => /\.jpe?g$/i.test(f))
@@ -138,7 +145,8 @@ async function worker() {
 sharp.concurrency(1);
 await Promise.all(Array.from({ length: Math.max(1, os.cpus().length - 1) }, worker));
 
-fs.writeFileSync(path.join(out, "m.bin"), await seal(key, new TextEncoder().encode(JSON.stringify(dims))));
+const manifest = { dims, categories };
+fs.writeFileSync(path.join(out, "m.bin"), await seal(key, new TextEncoder().encode(JSON.stringify(manifest))));
 meta = {
   v: 1,
   salt: b64(salt),
@@ -148,3 +156,34 @@ meta = {
 };
 fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
 console.log("done");
+
+// Expands "12-40" style ranges and checks the non-highlight categories cover
+// every photo exactly once. Runs before any image work so mistakes fail fast.
+function loadCategories() {
+  const file = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "categories.json");
+  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  const count = fs.readdirSync(src).filter((f) => /\.jpe?g$/i.test(f)).length;
+  const expand = (list) =>
+    list.flatMap((item) => {
+      if (typeof item === "number") return [item];
+      const [a, b] = item.split("-").map(Number);
+      return Array.from({ length: b - a + 1 }, (_, k) => a + k);
+    });
+  const cats = raw.map((c) => ({ name: c.name, photos: [...new Set(expand(c.photos))].sort((x, y) => x - y) }));
+  const highlights = new Set(cats[0].photos);
+  const seen = new Map();
+  for (const c of cats.slice(1)) for (const i of c.photos) seen.set(i, [...(seen.get(i) || []), c.name]);
+  const problems = [];
+  for (let i = 0; i < count; i++) {
+    const where = seen.get(i) || [];
+    if (where.length > 1) problems.push(`photo ${i} is in ${where.join(" and ")}`);
+    if (!where.length && !highlights.has(i)) problems.push(`photo ${i} has no category`);
+  }
+  for (const c of cats) for (const i of c.photos) if (i < 0 || i >= count) problems.push(`${c.name} lists photo ${i}, which does not exist`);
+  if (problems.length) {
+    console.error("tools/categories.json:\n  " + problems.join("\n  "));
+    process.exit(1);
+  }
+  for (const c of cats) console.log(`  ${c.name}: ${c.photos.length}`);
+  return cats;
+}
