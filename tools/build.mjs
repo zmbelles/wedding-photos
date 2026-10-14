@@ -21,6 +21,10 @@
  * hand-picked set that may repeat photos; every other photo must land in
  * exactly one of the remaining categories, or the build stops and says which.
  *
+ * Photos listed in tools/removed.json are left out entirely: dropped from every
+ * category (Highlights included) and their encrypted files deleted. They keep
+ * their numbers, so nothing else gets renamed.
+ *
  * Re-running reuses the salt in p/meta.json and skips photos already built, so
  * it resumes after an interruption. It refuses to run with a different
  * password than the existing output was built with.
@@ -89,6 +93,15 @@ if (meta) {
   }
 }
 
+const toolsDir = path.dirname(fileURLToPath(import.meta.url));
+// Expands a list of numbers and "12-40" style ranges.
+const expand = (list) =>
+  list.flatMap((item) => {
+    if (typeof item === "number") return [item];
+    const [a, b] = item.split("-").map(Number);
+    return Array.from({ length: b - a + 1 }, (_, k) => a + k);
+  });
+const removed = new Set(expand(JSON.parse(fs.readFileSync(path.join(toolsDir, "removed.json"), "utf8"))));
 const categories = loadCategories();
 
 const files = fs
@@ -106,6 +119,12 @@ async function build(i) {
   const fullOut = path.join(out, "f", `${id}.bin`);
   const thumbOut = path.join(out, "t", `${id}.bin`);
   const cacheKey = files[i];
+  if (removed.has(i)) {
+    fs.rmSync(fullOut, { force: true });
+    fs.rmSync(thumbOut, { force: true });
+    dims[i] = null;
+    return false;
+  }
   if (cachedDims[cacheKey] && fs.existsSync(fullOut) && fs.existsSync(thumbOut)) {
     dims[i] = cachedDims[cacheKey];
     return false;
@@ -157,18 +176,11 @@ meta = {
 fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
 console.log("done");
 
-// Expands "12-40" style ranges and checks the non-highlight categories cover
-// every photo exactly once. Runs before any image work so mistakes fail fast.
+// Checks the non-highlight categories cover every photo exactly once, then
+// drops removed photos. Runs before any image work so mistakes fail fast.
 function loadCategories() {
-  const file = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "categories.json");
-  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  const raw = JSON.parse(fs.readFileSync(path.join(toolsDir, "categories.json"), "utf8"));
   const count = fs.readdirSync(src).filter((f) => /\.jpe?g$/i.test(f)).length;
-  const expand = (list) =>
-    list.flatMap((item) => {
-      if (typeof item === "number") return [item];
-      const [a, b] = item.split("-").map(Number);
-      return Array.from({ length: b - a + 1 }, (_, k) => a + k);
-    });
   const cats = raw.map((c) => ({ name: c.name, photos: [...new Set(expand(c.photos))].sort((x, y) => x - y) }));
   const highlights = new Set(cats[0].photos);
   const seen = new Map();
@@ -180,10 +192,15 @@ function loadCategories() {
     if (!where.length && !highlights.has(i)) problems.push(`photo ${i} has no category`);
   }
   for (const c of cats) for (const i of c.photos) if (i < 0 || i >= count) problems.push(`${c.name} lists photo ${i}, which does not exist`);
+  for (const i of removed) if (i < 0 || i >= count) problems.push(`removed.json lists photo ${i}, which does not exist`);
   if (problems.length) {
-    console.error("tools/categories.json:\n  " + problems.join("\n  "));
+    console.error("tools/categories.json / removed.json:\n  " + problems.join("\n  "));
     process.exit(1);
   }
-  for (const c of cats) console.log(`  ${c.name}: ${c.photos.length}`);
+  for (const c of cats) {
+    c.photos = c.photos.filter((i) => !removed.has(i));
+    console.log(`  ${c.name}: ${c.photos.length}`);
+  }
+  console.log(`  (removed: ${removed.size})`);
   return cats;
 }
